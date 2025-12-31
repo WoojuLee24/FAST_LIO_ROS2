@@ -51,7 +51,17 @@ void Preprocess::process(const livox_ros_driver2::msg::CustomMsg::UniquePtr &msg
 }
 
 void Preprocess::process(const sensor_msgs::msg::PointCloud2::UniquePtr &msg, PointCloudXYZI::Ptr& pcl_out)
-{
+{ 
+
+  // === 디버깅: lidar_type 확인 ===
+  RCLCPP_INFO(rclcpp::get_logger("preprocess"),
+              "[process] lidar_type=%d, width=%d, height=%d, fields=%lu",
+              lidar_type, msg->width, msg->height, msg->fields.size());
+  for (auto f : msg->fields) {
+      RCLCPP_INFO(rclcpp::get_logger("preprocess"), "  Field: %s (offset=%d, datatype=%d, count=%d)",
+                  f.name.c_str(), f.offset, f.datatype, f.count);
+  }
+
   switch (time_unit)
   {
     case SEC:
@@ -74,21 +84,29 @@ void Preprocess::process(const sensor_msgs::msg::PointCloud2::UniquePtr &msg, Po
   switch (lidar_type)
   {
     case OUST64:
+      RCLCPP_INFO(rclcpp::get_logger("preprocess"), "[process] using oust64_handler");
       oust64_handler(msg);
       break;
 
     case VELO16:
+      RCLCPP_INFO(rclcpp::get_logger("preprocess"), "[process] using velodyne_handler");
       velodyne_handler(msg);
       break;
 
     case MID360:
+      RCLCPP_INFO(rclcpp::get_logger("preprocess"), "[process] using mid360_handler");
       mid360_handler(msg);
       break;
 
     default:
+      RCLCPP_INFO(rclcpp::get_logger("preprocess"), "[process] using default_handler");
       default_handler(msg);
       break;
   }
+
+  RCLCPP_INFO(rclcpp::get_logger("preprocess"),
+              "[process] After handler: pl_surf.size=%d", (int)pl_surf.size());
+
   *pcl_out = pl_surf;
 }
 
@@ -180,7 +198,7 @@ void Preprocess::avia_handler(const livox_ros_driver2::msg::CustomMsg::UniquePtr
           pl_full[i].curvature = msg->points[i].offset_time /
                                  float(1000000);  // use curvature as time of each laser points, curvature unit: ms
 
-          if(((abs(pl_full[i].x - pl_full[i-1].x) > 1e-7) 
+          if(((abs(pl_full[i].x - pl_full[i-1].x) > 1e-7)
               || (abs(pl_full[i].y - pl_full[i-1].y) > 1e-7)
               || (abs(pl_full[i].z - pl_full[i-1].z) > 1e-7))
               && (pl_full[i].x * pl_full[i].x + pl_full[i].y * pl_full[i].y + pl_full[i].z * pl_full[i].z > (blind * blind)))
@@ -201,10 +219,15 @@ void Preprocess::oust64_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &
   pcl::PointCloud<ouster_ros::Point> pl_orig;
   pcl::fromROSMsg(*msg, pl_orig);
   int plsize = pl_orig.size();
+
+  RCLCPP_INFO(rclcpp::get_logger("preprocess"),
+              "[oust64_handler] converted point size=%d", plsize);
+
   pl_corn.reserve(plsize);
   pl_surf.reserve(plsize);
   if (feature_enabled)
-  {
+  {  
+    RCLCPP_INFO(rclcpp::get_logger("preprocess"), "[oust64_handler] feature_enabled=TRUE");
     for (int i = 0; i < N_SCANS; i++)
     {
       pl_buff[i].clear();
@@ -260,7 +283,8 @@ void Preprocess::oust64_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &
     }
   }
   else
-  {
+  { 
+    RCLCPP_INFO(rclcpp::get_logger("preprocess"), "[oust64_handler] feature_enabled=FALSE");
     double time_stamp = rclcpp::Time(msg->header.stamp).seconds();
     // cout << "===================================" << endl;
     // printf("Pt size = %d, N_SCANS = %d\r\n", plsize, N_SCANS);
@@ -289,6 +313,8 @@ void Preprocess::oust64_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &
       pl_surf.points.push_back(added_pt);
     }
   }
+  RCLCPP_INFO(rclcpp::get_logger("preprocess"),
+              "[oust64_handler] pl_surf.size=%d", (int)pl_surf.size());
   // pub_func(pl_surf, pub_full, msg->header.stamp);
   // pub_func(pl_surf, pub_corn, msg->header.stamp);
 }
@@ -362,7 +388,6 @@ void Preprocess::velodyne_handler(const sensor_msgs::msg::PointCloud2::UniquePtr
         double yaw_angle = atan2(added_pt.y, added_pt.x) * 57.2957;
         if (is_first[layer])
         {
-          // printf("layer: %d; is first: %d", layer, is_first[layer]);
           yaw_fp[layer] = yaw_angle;
           is_first[layer] = false;
           added_pt.curvature = 0.0;
