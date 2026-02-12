@@ -21,16 +21,18 @@ def generate_launch_description():
     config_file = LaunchConfiguration('config_file')
     rviz_use = LaunchConfiguration('rviz')
     rviz_cfg = LaunchConfiguration('rviz_cfg')
+    log_level = LaunchConfiguration('log_level')
+
 
     declare_use_sim_time_cmd = DeclareLaunchArgument(
-        'use_sim_time', default_value='false',
+        'use_sim_time', default_value='true',
         description='Use simulation (Gazebo) clock if true'
     )
     declare_config_path_cmd = DeclareLaunchArgument(
         'config_path', default_value=default_config_path,
         description='Yaml config file path'
     )
-    decalre_config_file_cmd = DeclareLaunchArgument(
+    declare_config_file_cmd = DeclareLaunchArgument(
         'config_file', default_value='mid360.yaml',
         description='Config file'
     )
@@ -43,26 +45,35 @@ def generate_launch_description():
         description='RViz config file path'
     )
 
+
+    declare_log_level_cmd = DeclareLaunchArgument('log_level', default_value='WARN',
+    description='Logging level (DEBUG, INFO, WARN, ERROR, FATAL)'
+    )
+
     fast_lio_node = Node(
         package='fast_lio',
         executable='fastlio_mapping',
         parameters=[PathJoinSubstitution([config_path, config_file]),
                     {'use_sim_time': use_sim_time}],
-        output='screen'
+        output='screen',
+        arguments=['--ros-args', '--log-level', log_level]   
+
     )
     rviz_node = Node(
         package='rviz2',
         executable='rviz2',
         arguments=['-d', rviz_cfg],
-        condition=IfCondition(rviz_use)
+        condition=IfCondition(rviz_use),
+        parameters=[{'use_sim_time': use_sim_time}],
     )
 
     ld = LaunchDescription()
     ld.add_action(declare_use_sim_time_cmd)
     ld.add_action(declare_config_path_cmd)
-    ld.add_action(decalre_config_file_cmd)
+    ld.add_action(declare_config_file_cmd)
     ld.add_action(declare_rviz_cmd)
     ld.add_action(declare_rviz_config_path_cmd)
+    ld.add_action(declare_log_level_cmd)
 
     ld.add_action(fast_lio_node)
     ld.add_action(rviz_node)

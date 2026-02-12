@@ -143,6 +143,11 @@ geometry_msgs::msg::PoseStamped msg_body_pose;
 shared_ptr<Preprocess> p_pre(new Preprocess());
 shared_ptr<ImuProcess> p_imu(new ImuProcess());
 
+//DEBUG
+double last_sync_time = 0.0;
+double last_sync_time2 = 0.0;
+double last_timer_time = 0.0;
+
 void SigHandle(int sig)
 {
     flg_exit = true;
@@ -281,10 +286,32 @@ void lasermap_fov_segment()
 }
 
 void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg) 
-{
+{   
+    double t_cbk_start = omp_get_wtime();
+    static double last_cbk_time = -1.0;  
+    static int cbk_count = 0;
+
     mtx_buffer.lock();
     scan_count ++;
     double cur_time = get_time_sec(msg->header.stamp);
+
+
+    // DEBUG
+    if (last_cbk_time > 0.0) {
+    double dt = cur_time - last_cbk_time;  // LiDAR 프레임 간격
+    RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
+        "[CALLBACK-FREQ] dt=%.3f ms (~%.2f Hz), cbk_count=%d",
+        dt * 1000.0, 1.0 / dt, ++cbk_count);
+    }
+    last_cbk_time = cur_time;
+
+    //     // ================== 디버깅 로그 ==================
+    // RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
+    //             "[standard_pcl_cbk] LiDAR msg received at time=%.3f, points=%d, scan_count=%d",
+    //             cur_time, msg->width * msg->height, scan_count);
+    // // =================================================
+
+
     double preprocess_start_time = omp_get_wtime();
     if (!is_first_lidar && cur_time < last_timestamp_lidar)
     {
@@ -298,12 +325,27 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
 
     PointCloudXYZI::Ptr  ptr(new PointCloudXYZI());
     p_pre->process(msg, ptr);
+    // // ================== 디버깅 로그 ==================
+    // RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
+    //         "[standard_pcl_cbk] After preprocess: %d points",
+    //         static_cast<int>(ptr->points.size()));
+    // // =================================================
+
     lidar_buffer.push_back(ptr);
+    // RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
+    //         "[standard_pcl_cbk] push lidar_buffer, size(before)=%zu -> size(after)=%zu",
+    //         lidar_buffer.size(), lidar_buffer.size()+1);
     time_buffer.push_back(cur_time);
     last_timestamp_lidar = cur_time;
     s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
     mtx_buffer.unlock();
     sig_buffer.notify_all();
+
+    double t_cbk_end = omp_get_wtime();
+    RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
+        "[CALLBACK-END] exec_time=%.3f ms, queue_size=%zu",
+        (t_cbk_end - t_cbk_start) * 1000.0,
+        lidar_buffer.size());
 }
 
 double timediff_lidar_wrt_imu = 0.0;
@@ -363,6 +405,12 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
 
     double timestamp = get_time_sec(msg->header.stamp);
 
+    // // ================== 디버깅 로그 ==================
+    // RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
+    //             "[imu_cbk] IMU msg received at time=%.3f, publish_count=%d",
+    //             timestamp, publish_count);
+    // // =================================================
+
     mtx_buffer.lock();
 
     if (timestamp < last_timestamp_imu)
@@ -381,20 +429,79 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
 double lidar_mean_scantime = 0.0;
 int    scan_num = 0;
 bool sync_packages(MeasureGroup &meas)
-{
+{   
+    double t_sync_start = omp_get_wtime();
+    int sync_count = 0;
+
+    // RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
+    //         "[sync_packages] sync init");
+
+    // if (lidar_buffer.empty() || imu_buffer.empty()) {
+    //     // RCLCPP_WARN(rclcpp::get_logger("laser_mapping"),
+    //     //     "[sync_packages] Buffer empty: lidar_buffer=%ld, imu_buffer=%ld",
+    //     //     lidar_buffer.size(), imu_buffer.size());
+    //     return false;
+        
+    // }
+
+    //DEBUG
+    static double last_empty_start = -1.0;
+    static bool was_empty = false;
+
     if (lidar_buffer.empty() || imu_buffer.empty()) {
+        // 처음 empty 상태로 들어온 순간 기록
+        if (!was_empty) {
+            last_empty_start = omp_get_wtime();
+            was_empty = true;
+        }
+
+        // empty 상태가 지속되는 시간 출력
+        double elapsed = (omp_get_wtime() - last_empty_start) * 1000.0;
+        RCLCPP_WARN(rclcpp::get_logger("laser_mapping"),
+            "[BUFFER-EMPTY] lidar=%zu imu=%zu elapsed=%.3f ms",
+            lidar_buffer.size(), imu_buffer.size(), elapsed);
+
         return false;
+    } else {
+        // 버퍼가 비었다가 다시 채워진 경우, empty 상태 지속 시간 출력
+        if (was_empty) {
+            double total_empty = (omp_get_wtime() - last_empty_start) * 1000.0;
+            RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
+                "[BUFFER-RECOVER] empty duration=%.3f ms (lidar=%zu imu=%zu)",
+                total_empty, lidar_buffer.size(), imu_buffer.size());
+            was_empty = false;
+        }
     }
+
+    // DEBUG
+    double now = omp_get_wtime();
+    if (last_sync_time > 0.0) {
+        double dt = now - last_sync_time;
+        RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
+            "[SYNC-FREQ-FILTERED] dt=%.3f ms (~%.1f Hz), sync_count=%d",
+            dt*1000.0, 1.0/dt, ++sync_count);
+    }
+    last_sync_time = now;
+
 
     /*** push a lidar scan ***/
     if(!lidar_pushed)
-    {
+    {   
+
         meas.lidar = lidar_buffer.front();
         meas.lidar_beg_time = time_buffer.front();
+
+        RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
+            "[sync_packages] New LiDAR scan: beg_time=%.6f, points=%d",
+            meas.lidar_beg_time, (int)meas.lidar->points.size());
+
         if (meas.lidar->points.size() <= 1) // time too little
         {
             lidar_end_time = meas.lidar_beg_time + lidar_mean_scantime;
             std::cerr << "Too few input point cloud!\n";
+            RCLCPP_WARN(rclcpp::get_logger("laser_mapping"),
+                "[sync_packages] Too few input point cloud! lidar_end_time=%.6f",
+                lidar_end_time);
         }
         else if (meas.lidar->points.back().curvature / double(1000) < 0.5 * lidar_mean_scantime)
         {
@@ -405,6 +512,7 @@ bool sync_packages(MeasureGroup &meas)
             scan_num ++;
             lidar_end_time = meas.lidar_beg_time + meas.lidar->points.back().curvature / double(1000);
             lidar_mean_scantime += (meas.lidar->points.back().curvature / double(1000) - lidar_mean_scantime) / scan_num;
+            
         }
 
         meas.lidar_end_time = lidar_end_time;
@@ -412,25 +520,50 @@ bool sync_packages(MeasureGroup &meas)
         lidar_pushed = true;
     }
 
+    // LiDAR vs IMU 시간 비교
+    // RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
+    //     "[sync_packages] Compare times: last_timestamp_imu=%.6f, lidar_end_time=%.6f",
+    //     last_timestamp_imu, lidar_end_time);
+
     if (last_timestamp_imu < lidar_end_time)
-    {
+    {   
+        RCLCPP_WARN(rclcpp::get_logger("laser_mapping"),
+                "[sync_packages] Waiting for more IMU... last_timestamp_imu=%.6f < lidar_end_time=%.6f",
+                last_timestamp_imu, lidar_end_time);
         return false;
     }
 
     /*** push imu data, and pop from imu buffer ***/
     double imu_time = get_time_sec(imu_buffer.front()->header.stamp);
     meas.imu.clear();
+
+    int imu_added = 0;
     while ((!imu_buffer.empty()) && (imu_time < lidar_end_time))
-    {
+    {   
         imu_time = get_time_sec(imu_buffer.front()->header.stamp);
         if(imu_time > lidar_end_time) break;
         meas.imu.push_back(imu_buffer.front());
+        // RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
+        //     "[sync_packages] popping imu_buffer (size=%zu)", imu_buffer.size());
         imu_buffer.pop_front();
+        imu_added++;
+
     }
 
+    // lidar_buffer.pop_front();
+    // time_buffer.pop_front();
+
+    if (lidar_buffer.size() > 2) { // temporary
     lidar_buffer.pop_front();
     time_buffer.pop_front();
+    }
+
     lidar_pushed = false;
+
+    double t_sync_end = omp_get_wtime();
+    RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
+        "[SYNC-END]  elapsed=%.3f ms", (t_sync_end - t_sync_start)*1000.0);
+
     return true;
 }
 
@@ -487,11 +620,21 @@ void map_incremental()
 PointCloudXYZI::Ptr pcl_wait_pub(new PointCloudXYZI());
 PointCloudXYZI::Ptr pcl_wait_save(new PointCloudXYZI());
 void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull)
-{
+{   
+    double t_pub_start = omp_get_wtime();
     if(scan_pub_en)
     {
         PointCloudXYZI::Ptr laserCloudFullRes(dense_pub_en ? feats_undistort : feats_down_body);
         int size = laserCloudFullRes->points.size();
+
+        // ================== 디버깅 로그 ==================
+        RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
+                    "[publish_frame_world] Publishing /cloud_registered with %d points (scan_pub_en=%d)",
+                    size, scan_pub_en);
+        // =================================================
+
+
+        
         PointCloudXYZI::Ptr laserCloudWorld( \
                         new PointCloudXYZI(size, 1));
 
@@ -508,12 +651,23 @@ void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Share
         laserCloudmsg.header.frame_id = "camera_init";
         pubLaserCloudFull->publish(laserCloudmsg);
         publish_count -= PUBFRAME_PERIOD;
+        double t_pub_end = omp_get_wtime();
+        RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
+        "[PUBLISH-END] took %.3f ms", (t_pub_end - t_pub_start)*1000.0);
+
     }
+    else
+    {
+        RCLCPP_WARN(rclcpp::get_logger("laser_mapping"),
+                    "[publish_frame_world] scan_pub_en = FALSE → skipping publish");
+    }
+
+    
 
     /**************** save map ****************/
     /* 1. make sure you have enough memories
     /* 2. noted that pcd save will influence the real-time performences **/
-    /*
+    
     if (pcd_save_en)
     {
         int size = feats_undistort->points.size();
@@ -540,7 +694,7 @@ void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Share
             scan_wait_num = 0;
         }
     }
-    */
+    
 }
 
 void publish_frame_body(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body)
@@ -937,11 +1091,13 @@ public:
 
         //------------------------------------------------------------------------------------------------------
         auto period_ms = std::chrono::milliseconds(static_cast<int64_t>(1000.0 / 100.0));
-        timer_ = rclcpp::create_timer(this, this->get_clock(), period_ms, std::bind(&LaserMappingNode::timer_callback, this));
-
+        // timer_ = rclcpp::create_timer(this, this->get_clock(), period_ms, std::bind(&LaserMappingNode::timer_callback, this)); // ERROR
+        timer_ = this->create_wall_timer(period_ms, std::bind(&LaserMappingNode::timer_callback, this)
+);
         auto map_period_ms = std::chrono::milliseconds(static_cast<int64_t>(1000.0));
-        map_pub_timer_ = rclcpp::create_timer(this, this->get_clock(), map_period_ms, std::bind(&LaserMappingNode::map_publish_callback, this));
-
+        // map_pub_timer_ = rclcpp::create_timer(this, this->get_clock(), map_period_ms, std::bind(&LaserMappingNode::map_publish_callback, this));
+        map_pub_timer_ = this->create_wall_timer(map_period_ms, std::bind(&LaserMappingNode::map_publish_callback, this)
+);
         map_save_srv_ = this->create_service<std_srvs::srv::Trigger>("map_save", std::bind(&LaserMappingNode::map_save_callback, this, std::placeholders::_1, std::placeholders::_2));
 
         RCLCPP_INFO(this->get_logger(), "Node init finished.");
@@ -956,9 +1112,24 @@ public:
 
 private:
     void timer_callback()
-    {
+    {   
+        int sync_count = 0;
         if(sync_packages(Measures))
-        {
+        {   
+            // DEBUG
+            double now = omp_get_wtime();
+            if (last_timer_time > 0.0) {
+                double dt = now - last_timer_time;
+                RCLCPP_INFO(this->get_logger(),
+                    "[TIMER-FREQ] dt=%.3f ms (~%.1f Hz), sync_count=%d",
+                    dt*1000.0, 1.0/dt, ++sync_count);
+            }
+            last_timer_time = now;
+            // // ================== 디버깅 로그 ==================
+            // RCLCPP_INFO(rclcpp::get_logger("laser_mapping"),
+            //         "[timer_callback] Sync success: lidar_beg_time=%.3f, lidar_end_time=%.3f, imu_count=%lu",
+            //         Measures.lidar_beg_time, Measures.lidar_end_time, Measures.imu.size());
+            // // =================================================
             if (flg_first_scan)
             {
                 first_lidar_time = Measures.lidar_beg_time;
@@ -979,6 +1150,11 @@ private:
             p_imu->Process(Measures, kf, feats_undistort);
             state_point = kf.get_x();
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
+            
+            double t_imu_proc = omp_get_wtime();
+            // RCLCPP_INFO(this->get_logger(),
+            //     "[PERF] IMU Process time = %.3f ms",
+            //     (t_imu_proc - t0) * 1000.0);
 
             if (feats_undistort->empty() || (feats_undistort == NULL))
             {
@@ -990,11 +1166,19 @@ private:
                             false : true;
             /*** Segment the map in lidar FOV ***/
             lasermap_fov_segment();
+            double t_fov = omp_get_wtime();
+            // RCLCPP_INFO(this->get_logger(),
+            //     "[PERF] lasermap_fov_segment = %.3f ms",
+            //     (t_fov - t_imu_proc) * 1000.0);
 
             /*** downsample the feature points in a scan ***/
             downSizeFilterSurf.setInputCloud(feats_undistort);
             downSizeFilterSurf.filter(*feats_down_body);
             t1 = omp_get_wtime();
+            // RCLCPP_INFO(this->get_logger(),
+            //     "[PERF] Downsample = %.3f ms (down points=%d)",
+            //     (t1 - t_fov) * 1000.0, feats_down_size);
+
             feats_down_size = feats_down_body->points.size();
             /*** initialize the map kdtree ***/
             if(ikdtree.Root_Node == nullptr)
@@ -1059,6 +1243,10 @@ private:
             geoQuat.w = state_point.rot.coeffs()[3];
 
             double t_update_end = omp_get_wtime();
+            double t_icp_end = omp_get_wtime();
+            // RCLCPP_INFO(this->get_logger(),
+            //     "[PERF] ICP+EKF update = %.3f ms (iter=%d, effct_feat_num=%d)",
+            //     (t_icp_end - t_update_start) * 1000.0, NUM_MAX_ITERATIONS, effct_feat_num);
 
             /******* Publish odometry *******/
             publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
@@ -1067,15 +1255,24 @@ private:
             t3 = omp_get_wtime();
             map_incremental();
             t5 = omp_get_wtime();
-            
+            RCLCPP_INFO(this->get_logger(),
+                "[PERF] map_incremental = %.3f ms (added=%d)",
+                (t5 - t3) * 1000.0, add_point_size);
+
             /******* Publish points *******/
+            // double t_pub_start = omp_get_wtime();
             if (path_en)                         publish_path(pubPath_);
             if (scan_pub_en)      publish_frame_world(pubLaserCloudFull_);
             if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body_);
             if (effect_pub_en) publish_effect_world(pubLaserCloudEffect_);
             // if (map_pub_en) publish_map(pubLaserCloudMap_);
+            // double t_pub_end = omp_get_wtime();
+            // RCLCPP_INFO(this->get_logger(),
+            //     "[PERF] Publish = %.3f ms",
+            //     (t_pub_end - t_pub_start) * 1000.0);
 
             /*** Debug variables ***/
+            
             if (runtime_pos_log)
             {
                 frame_num ++;
@@ -1104,7 +1301,18 @@ private:
                 <<" "<<state_point.bg.transpose()<<" "<<state_point.ba.transpose()<<" "<<state_point.grav<<" "<<feats_undistort->points.size()<<endl;
                 dump_lio_state_to_log(fp);
             }
+            double t_end = omp_get_wtime();
+                RCLCPP_INFO(this->get_logger(),
+                "[PERF] Frame total = %.3f ms (~%.1f Hz)",
+                (t_end - t0) * 1000.0, 1.0 / (t_end - t0));
         }
+        else
+    {
+        // ================== 디버깅 로그 ==================
+        // RCLCPP_WARN(rclcpp::get_logger("laser_mapping"),
+        //             "[timer_callback] sync_packages returned FALSE → waiting for more data");
+        // =================================================
+    }
     }
 
     void map_publish_callback()
@@ -1160,7 +1368,14 @@ int main(int argc, char** argv)
 
     signal(SIGINT, SigHandle);
 
-    rclcpp::spin(std::make_shared<LaserMappingNode>());
+    // rclcpp::spin(std::make_shared<LaserMappingNode>());
+    auto node = std::make_shared<LaserMappingNode>();
+
+    // 멀티스레드 executor 사용 (예: 4개 스레드)
+    rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 1);
+    executor.add_node(node);
+    executor.spin();
+
 
     if (rclcpp::ok())
         rclcpp::shutdown();
@@ -1169,11 +1384,27 @@ int main(int argc, char** argv)
     /* 2. pcd save will largely influence the real-time performences **/
     if (pcl_wait_save->size() > 0 && pcd_save_en)
     {
-        string file_name = string("scans.pcd");
-        string all_points_dir(string(string(ROOT_DIR) + "PCD/") + file_name);
+        // string file_name = string("scans.pcd");
+        // string all_points_dir(string(string(ROOT_DIR) + "PCD/") + file_name);
+        
+        // pcl::PCDWriter pcd_writer;
+        // cout << "current scan saved to /PCD/" << file_name<<endl;
+        // pcd_writer.writeBinary(all_points_dir, *pcl_wait_save);
+
+        string save_path = map_file_path; 
+        if (save_path.empty()) {
+            save_path = string(ROOT_DIR) + "PCD/scans.pcd";
+        }
+        
         pcl::PCDWriter pcd_writer;
-        cout << "current scan saved to /PCD/" << file_name<<endl;
-        pcd_writer.writeBinary(all_points_dir, *pcl_wait_save);
+        std::cout << "[PCD-SAVE] Saving all points to: " << save_path << std::endl;
+        
+        if (pcd_writer.writeBinary(save_path, *pcl_wait_save) == 0) {
+            std::cout << "[PCD-SAVE] SUCCESS!" << std::endl;
+        } else {
+            std::cerr << "[PCD-SAVE] FAILED! Check directory path: " << save_path << std::endl;
+        }
+
     }
 
     if (runtime_pos_log)
